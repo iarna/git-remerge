@@ -1,0 +1,302 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use feature qw( say switch );
+sub apply (&@);
+sub capture(@);
+sub cat($);
+sub put(@);
+sub uniq(@);
+
+$| = 1;
+
+my($gitdir) = capture qw( git rev-parse --git-dir );
+
+if (!$gitdir) {
+    die "Could not determine .git directory, are you sure you're in a repository?\n";
+}
+
+my($branch) = cat "$gitdir/remerge-branch";
+
+if ($branch) {
+    my($curbranch) = capture qw(git rev-parse --abbrev-ref HEAD);
+    if ($curbranch ne $branch) {
+        run(qw( git checkout -q ), $branch);
+    }
+}
+
+my($cid) = cat "$gitdir/remerge-cid";
+
+
+my @tomerge = get_tomerge();
+
+my $interactive = 0;
+my $cmd = 'remerge';
+my @arg;
+my $newbase;
+my @arghandler;
+for (@ARGV) {
+    when (/^--(abort|continue|skip|edit-todo)$/) {
+        if ($cmd ne 'remerge') { die "Can't issue multiple commands, tried: --$cmd and $_\n" }
+        $cmd = $1;
+    }
+    when (/^-i$|^--interactive$/) {
+        $interactive = 1;
+    }
+    when (/^--onto$/) {
+        push @arghandler, sub { $newbase = $_ };
+    }
+    when (/^-/) {
+        die "Unknown argument: $_\n";
+    }
+    default {
+        if (@arghandler) {
+            (shift @arghandler)->();
+        }
+        else {
+            push @arg, $_;
+        }
+    }
+}
+
+if ($cmd eq 'remerge') {
+    if ($branch) {
+        die "Can't start a new remerge while an old one is in progress, use --abort, --continue or --skip to complete it\n";
+    }
+    if (@arg>2) {
+        die "Extra positional argument, only expected two: ".(join ", ", @arg)."\n";
+    }
+    my $upstream = shift @arg if @arg;
+    $branch = shift @arg if @arg;
+    if (!$upstream) {
+        # TODO: Figure out how to make this behave more like rebase
+        $upstream = 'master';
+    }
+    if (!$newbase) { $newbase = $upstream }
+    if (!$branch) {
+        my @branches = map { substr($_,2) } capture qw(git branch --contains HEAD);
+        if (@branches>1) {
+            die "Can't determine current branch name, more than one result detected: " . (join ', ', @branches) . "\n";
+        }
+        ($branch) = @branches;
+    }
+    my @rawmerges = uniq reverse map { m{^Merge branch '(.+?)' into} and $1 } grep {/into \Q$branch/} capture qw(git log --format=%s --merges master...);
+
+    if (!@rawmerges) {
+        exec(qw( git rebase -i ), $upstream, $branch);
+    }
+
+    my %seen = ();
+    my @rawcommits = map { /^(\S+) Merge branch '(.+?)' into \Q$branch/ ? "merge $1 $2" : "pick $_" } # format the result
+                     grep { !/Merge branch '(.+?)' into \Q$branch/ or not $seen{$1}++ } # unique merges only
+                     reverse
+                     capture qw( git log ),'--format=%h %s',(map { "^$_" } @rawmerges),qw( master... );
+
+    if ($interactive) {    
+        @tomerge = edit_tomerge(  @rawcommits );
+    }
+    else {
+        @tomerge = @rawcommits;
+    }
+    
+    if (!@tomerge) {
+        unlink "$gitdir/remerge-merge-branches";
+        die "No merges found to remerge, aborting.\n";
+    }
+
+    say "Reintegrating $branch from $upstream...";
+
+    run(qw( git checkout -q ), $upstream);
+    run(qw( git pull --rebase -q ));
+    run(qw( git checkout -q),$branch);
+    put "$gitdir/remerge-cid", capture qw(git rev-parse HEAD);
+    put "$gitdir/remerge-branch", $branch;
+    run(qw( git reset --hard -q ), $upstream);
+    runmerges();
+}
+elsif ($cmd eq 'edit-todo') {
+    if (!$branch or !$cid) {
+        die "Not in a remerge so can't abort it\n";
+    }
+    @tomerge = edit_tomerge(@tomerge);
+    if (!@tomerge) {
+        unlink "$gitdir/remerge-cid";
+        unlink "$gitdir/remerge-branch";
+        unlink "$gitdir/remerge-merge-branches";
+        die "No merges found to remerge, aborting.\n";
+    }
+}
+elsif ($cmd eq 'abort') {
+    if (!$branch or !$cid) {
+        die "Not in a remerge so can't abort it\n";
+    }
+    run(qw( git reset --hard ), $cid);
+    unlink "$gitdir/remerge-cid";
+    unlink "$gitdir/remerge-branch";
+    unlink "$gitdir/remerge-merge-branches";
+    exit(0);
+}
+elsif ($cmd eq 'skip') {
+    if (!$branch or !$cid) {
+        die "Not in a remerge so can't skip\n";
+    }
+    run(qw( git reset --hard -q ));
+    runmerges();
+}
+elsif ($cmd eq 'continue') {
+    if (!$branch or !$cid) {
+        die "Not in a remerge so can't continue\n";
+    }
+    if (system(qw( git diff-files --quiet --ignore-submodules -- ))) {
+        die "Cannot continue there are unstaged changes";
+    }
+    if (system(qw( git diff-index --cached --quiet HEAD --ignore-submodules -- ))) {
+        run(qw( git commit --no-edit ));
+    }
+    runmerges();
+}
+
+sub runmerges {
+    while (my $merge = shift @tomerge) {
+        put "$gitdir/remerge-merge-branches", @tomerge;
+        my($action, $commit, $what) = split / /, $merge, 3;
+        my @result;
+        if ($action =~ /^m(?:erge)?$/) {
+            say "Merging $what...";
+            run(qw( git checkout -q ), $what);
+            run(qw( git pull -q ));
+            run(qw( git checkout -q ), $branch);
+            push @result, capture qw( git merge --no-ff ), $what;
+        }
+        elsif ($action =~ /^p(?:ick)?$/ or $action =~ /^e(?:dit)?$/) {
+            say "Picking $commit $what";
+            push @result, capture qw( git cherry-pick --ff ), $commit;
+        }
+        elsif ($action =~ /^f(?:ixup)?$/) {
+            say "Picking for fixup $commit $what";
+            push @result, capture qw( git cherry-pick --ff -n ), $commit;
+            push @result, capture qw( git commit --amend --no-edit );
+        }
+        elsif ($action =~ /^r(?:eword)?$/) {
+            say "Picking for reword $commit $what";
+            push @result, capture qw( git cherry-pick --ff --edit ), $commit;
+        }
+        elsif ($merge =~ /^(?:x|exec) (.*)/) {
+            say "Executing $1";
+            if (system($1)!=0) {
+                say "Non-zero result code from exec line, halting to let you investigate";
+                say "To continue, run: git remerge --continue";
+                exit(1);
+            }
+        }
+        else {
+            die "Unknown action $action\n$_\n";
+        }
+        my $conflicts = 0;
+        my $rerere;
+        for (@result) {
+            ++ $conflicts if /^CONFLICT/;
+            if (/Merge conflict in (.*)/) {
+                if (! grep {/^<<<<<<</} cat $1) {
+                    $conflicts --;
+                    $rerere ++;
+                    run(qw( git add ), $1);
+                }
+            }
+            elsif (/^Exited with error/) {
+                $conflicts ++;
+            }
+            else {
+                say;
+            }
+        }
+        if ($conflicts and (!$rerere or $conflicts>1)) {
+            say "Resolve merge conflict and then run: git remerge --continue";
+            exit(1);
+        }
+        if ($rerere) {
+            run(qw( git commit --no-edit ));
+        }
+        if ($action =~ /^e(?:dit)$/) {
+            say "Stopping to edit, continue with: git remerge --continue";
+            exit(1);
+        }
+    }
+    unlink "$gitdir/remerge-cid";
+    unlink "$gitdir/remerge-branch";
+    unlink "$gitdir/remerge-merge-branches";
+    say "Reintegration complete";
+}
+
+sub apply (&@) {
+    my $action = shift;
+    &$action foreach my @values = @_;
+    wantarray ? @values : $values[-1];
+}
+
+sub capture(@) {
+    my( @cmd ) = @_;
+    local $!;
+    open my $fh, '-|', @cmd
+        or die "Could not fork to run ".(join ' ',@cmd).": $!";
+    my @result = apply { s/\n$//g } <$fh>;
+    close $fh
+        or push @result, "Exited with error code: ".($? >> 8).($!?" $!":"");
+    return wantarray ? @result : @result ? $result[0] : ();
+}
+
+sub cat($) {
+    my( $filename ) = @_;
+    return unless -f $filename;
+    open my $fh, '<', $filename
+        or die "Couldn't read $filename: $!";
+    my @result = apply { s/\n$//g } <$fh>;
+    close $fh or die "Error reading $filename: $!";
+    return @result;
+}
+
+sub put(@) {
+    my($filename, @content) = @_;
+    open my $fh, '>', $filename
+        or die "Couldn't write $filename: $!";
+    print $fh join "\n", @content;
+    close $fh or die "Error writing $filename: $!\n";
+}
+
+sub run {
+    system(@_) and die "Error running ".(join ' ',@_).": (".($?>>8).") $!";
+}
+
+sub uniq (@) {
+    my %seen = ();
+    grep { not $seen{$_}++ } @_;
+}
+
+sub get_tomerge {
+    return grep {!/^#/ and /\S/} cat "$gitdir/remerge-merge-branches";
+}
+
+sub edit_tomerge {
+    my @tomerge = @_;
+    put "$gitdir/remerge-merge-branches", @tomerge, <<'EODOCS';
+
+#
+# Commands:
+#  m, merge = use merge
+#  p, pick = use commit
+#  r, reword = use commit, but edit the commit message
+#  e, edit = use commit, but stop for amending
+#  f, fixup = like "squash", but discard this commit's log message
+#  x, exec = run command (the rest of the line) using shell
+#
+# These lines can be re-ordered; they are executed from top to bottom.
+#
+# If you remove a line here THAT COMMIT WILL BE LOST.
+#
+# However, if you remove everything, the remerge will be aborted.
+#
+# Note that empty commits are commented out
+EODOCS
+    run($ENV{'VISUAL'} // $ENV{'EDITOR'} // '/usr/bin/vi', "$gitdir/remerge-merge-branches");
+    return get_tomerge();
+}
