@@ -85,6 +85,12 @@ if ($cmd eq 'remerge') {
     if (!@rawmerges) {
         exec(qw( git rebase -i ), $upstream, $branch);
     }
+    for (@rawmerges) {
+        say "Examining $_...";
+        run(qw( git checkout -q ), $_);
+        run(qw( git pull -q ));
+    }
+    run(qw( git checkout -q ), $branch);
 
     my %seen = ();
     my @rawcommits = map { /^(\S+) Merge branch '(.+?)' into \Q$branch/ ? "merge $1 $2" : "pick $_" } # format the result
@@ -163,9 +169,6 @@ sub runmerges {
         my @result;
         if ($action =~ /^m(?:erge)?$/) {
             say "Merging $what...";
-            run(qw( git checkout -q ), $what);
-            run(qw( git pull -q ));
-            run(qw( git checkout -q ), $branch);
             push @result, capture qw( git merge --no-ff ), $what;
         }
         elsif ($action =~ /^p(?:ick)?$/ or $action =~ /^e(?:dit)?$/) {
